@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# https://stackoverflow.com/questions/5722544/how-can-i-convert-an-mdb-access-file-to-mysql-or-plain-sql-file
+
+TABLES=$(mdb-tables -1 $1)
+
+MUSER="root"
+MPASS="root"
+MDB="$2"
+
+MYSQL=$(which mysql)
+
+for t in $TABLES
+do
+    $MYSQL -u $MUSER -p$MPASS $MDB -e "DROP TABLE IF EXISTS $t"
+done
+
+mdb-schema $1 mysql | $MYSQL -u $MUSER -p$MPASS $MDB
+
+for t in $TABLES
+do
+    mdb-export -D '%Y-%m-%d %H:%M:%S' -I mysql $1 $t | $MYSQL -u $MUSER -p$MPASS $MDB
+done

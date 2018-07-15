@@ -1,0 +1,418 @@
+---
+title: "AdventureWorks"
+author: "Julien Robert"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+---
+
+<style>                     
+.navbar {
+  background-color: #2ecc71;
+  border-color: black;
+}
+.navbar-brand {
+color: #ecf0f1 !important;
+}
+</style>
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(lubridate)
+library(countrycode)
+library(forecast)
+library(tseries)
+library(arules)
+library(arulesViz)
+library(highcharter)
+library(treemap)
+library(viridis)
+library(reshape2)
+load(".RData")
+
+thm <- 
+  hc_theme(
+    colors = c("#1a6ecc", "#434348", "#90ed7d"),
+    chart = list(
+      backgroundColor = "transparent",
+      style = list(fontFamily = "Source Sans Pro")
+    ),
+    xAxis = list(
+      gridLineWidth = 1
+    )
+  )
+```
+
+Financial Perspective
+=============
+
+Column {data-width=750}
+-----------------------------------------------------------------------
+
+### Orders Today
+
+```{r}
+orderToday <- sum(SDSales$OrderDate == max(SDSales$OrderDate))
+# the max date should be replaced by today in case of a updated dataset
+valueBox(orderToday, icon = "fa-shopping-basket", color = ifelse(orderToday < 50, "warning", "primary"))
+```
+
+### Sales Revenues
+
+```{r}
+SDSalesRev <- SDSales %>%
+  mutate(orderTotal = (UnitPrice - (UnitPrice * UnitPriceDiscount)) * OrderQty) %>%
+  group_by(OrderDate) %>%
+  summarise(revenue = sum(orderTotal))
+
+# Clean outliers from dataset
+SDSalesRev$clean_rev <- ts(SDSalesRev[, 'revenue']) %>%
+  as.vector() %>% # Small trick to fix issue 'time series not univariate'
+  ts() %>%
+  tsclean()
+
+# Create Daily and Monthly Moving Average for removing volatility
+SDSalesRev$rev_ma <- ma(SDSalesRev$clean_rev, order = 7)
+SDSalesRev$rev_ma30 <- ma(SDSalesRev$clean_rev, order = 30)
+
+# Plot Daily revenue to look for pattern
+p <- ggplot() +
+  geom_line(data = SDSalesRev, aes(x = as.Date(OrderDate),
+                                    y = clean_rev, colour = "Daily revenue")) +
+  geom_line(data = SDSalesRev, aes(x = as.Date(OrderDate),
+                                   y = rev_ma,   colour = "Weekly MA")) +
+  scale_x_date('month') +
+  scale_y_continuous() +
+  labs(x = "Date", y = "Daily AdventureWorks' revenues")
+ggplotly(p)
+```
+
+### World Sales
+
+```{r}
+worldMap <- map_data("world") %>%
+            subset(region != "Antarctica")
+SalesRep <- table(SDSales$CountryRegionCode) %>%
+            as.data.frame() %>%
+            as_tibble()
+names(SalesRep) <- c("Country", "Sales")
+
+# Rename iso2 country code to country names
+SalesRep$Country <- countrycode(SalesRep$Country, "iso2c", "country.name")
+# Rename USA to be shown in ggplot
+SalesRep$Country[SalesRep$Country == "United States"] <- "USA"
+
+ggplot() +
+  geom_map(dat = worldMap, map = worldMap, aes(map_id = region), fill = "white", color = "black", size = 0.25) +
+  geom_map(dat = SalesRep, map = worldMap, aes(map_id = Country, fill = log(Sales)), size = 0.25) +
+  scale_fill_gradient(low = "#fff7bc", high = "#cc4c02", name = "Sales amount (log)") +
+  expand_limits(x = worldMap$long, y = worldMap$lat) +
+  labs(x = "", y = "", title = "") +
+  theme(panel.grid = element_blank(), panel.border = element_blank()) +
+  theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+  theme(legend.position = "top")
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Percentage of Online Orders Today
+
+```{r}
+onlineOrder <- nrow(subset(SDSales, SDSales$OrderDate == max(SDSales$OrderDate) & SDSales$OnlineOrderFlag == 1)) / orderToday
+gauge(onlineOrder * 100, min = 0, max = 100, symbol = '%', gaugeSectors(
+  success = c(80, 100), warning = c(40, 79), danger = c(0, 39)
+))
+```
+
+### Sales by Subcategories
+
+```{r}
+p <- SDSales %>%
+  inner_join(SDProduct, by = "ProductID") %>%
+  group_by(CategoryName, SubcategoryName) %>%
+  summarise(amount = n())
+
+p <- treemap(p, index = c("CategoryName", "SubcategoryName"),
+              vSize = "amount", vColor = "amount",
+              type = "value", palette = rev(viridis(6)))
+
+highchart() %>% 
+  hc_add_series_treemap(p, allowDrillToNode = TRUE,
+                        layoutAlgorithm = "squarified") %>% 
+  hc_add_theme(thm)
+```
+
+### Latest Product Release
+
+```{r}
+den <- head(SDProduct[order(SDProduct$SellStartDate, decreasing = TRUE), ], 30)
+den[, c("ProductName", "StandardCost", "ListPrice", "SellStartDate")] %>%
+  datatable(rownames = FALSE)
+```
+
+Learning and Growth
+=============
+
+Row
+-----------------------------------------------------------------------
+
+### Sales Revenue
+
+```{r}
+p <- SDSales %>%
+  mutate(orderTotal = (UnitPrice - (UnitPrice * UnitPriceDiscount)) * OrderQty) %>%
+  group_by(year(OrderDate)) %>%
+  summarise(revenue = sum(orderTotal)) %>%
+  ggplot(aes(x = `year(OrderDate)`, y = revenue / 1000)) +
+  geom_line() +
+  labs(x = "Date (Year)", y = "Revenue (in thousands)", title = "") +
+  theme(legend.position = "top")
+ggplotly(p)
+```
+
+### Sales Forecast
+
+```{r}
+SDSalesRev <- SDSales %>%
+  mutate(orderTotal = (UnitPrice - (UnitPrice * UnitPriceDiscount)) * OrderQty) %>%
+  group_by(OrderDate) %>%
+  summarise(revenue = sum(orderTotal))
+
+# Clean outliers from dataset
+SDSalesRev$clean_rev <- ts(SDSalesRev[, 'revenue']) %>%
+  as.vector() %>% # Small trick to fix issue 'time series not univariate'
+  ts() %>%
+  tsclean()
+
+# Create Daily and Monthly Moving Average for removing volatility
+SDSalesRev$rev_ma <- ma(SDSalesRev$clean_rev, order = 7)
+SDSalesRev$rev_ma30 <- ma(SDSalesRev$clean_rev, order = 30)
+
+# Calculate Seasonal component (fluctuation based on calendar cycle)
+rev_ma = ts(na.omit(SDSalesRev$rev_ma), frequency = 30)
+decomp = stl(rev_ma, s.window = "periodic") # calculate seasonal comp
+deseasonal_rev <- seasadj(decomp)
+hold <- window(ts(deseasonal_rev), start = 800)
+
+fit_no_holdout = arima(ts(deseasonal_rev[-c(800:max(deseasonal_rev))]), order = c(0,1,9))
+
+fcast_no_holdout <- forecast(fit_no_holdout, h = 60)
+plot(fcast_no_holdout, main = " ")
+lines(ts(deseasonal_rev))
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Best-Seller Items
+
+```{r}
+SDSalesDev <- subset(SDSales, year(SDSales$OrderDate) == max(year(SDSales$OrderDate))) %>%
+  left_join(SDCustomer, by = "CustomerID") %>%
+  left_join(SDPersonCust, by = c("PersonID" = "BusinessEntityID")) %>%
+  left_join(SDProduct, by = "ProductID")
+
+# Cleanup dataframe
+SDSalesDev2 <- SDSalesDev[, c("CustomerID", "StoreID", "OnlineOrderFlag", "SalesOrderNumber",
+                       "OrderQty","UnitPrice", "UnitPriceDiscount", "EmailPromotion",
+                       "SpecialOfferID", "OrderDate", "ShipDate", "CountryRegionCode",
+                      "ProductName", "CategoryName", "SubcategoryName", "ProfitMargin")]
+
+SDSalesDev <- SDSalesDev2[, c("SalesOrderNumber", "ProductName")]
+# Clean product names by removing color / size
+SDSalesDev$ProductName <- sub('\\s*,.*', '', SDSalesDev$ProductName)
+SDSalesDev <- as.data.frame(unclass(SDSalesDev))
+SDSalesDev$ProductName <- as.factor(SDSalesDev$ProductName)
+
+# Dataframe in a "single" form and not "basket"
+trans4 <- as(split(SDSalesDev[,2], SDSalesDev[,1]), "transactions")
+
+# Create rules using Apriori algorithm
+itemFrequencyPlot(trans4, support = 0.09, cex.names = 0.8)
+```
+
+### Correlation Email Promotion
+
+```{r}
+SDSalesEmailPromo <- SDCustomer %>%
+  full_join(SDSales, by = "CustomerID") %>%
+  full_join(SDPersonCust, by = c("PersonID" = "BusinessEntityID")) %>%
+  group_by(SalesOrderNumber, CustomerID, EmailPromotion) %>%
+  summarise(orderSize = sum(OrderQty),
+            orderPrice = sum((UnitPrice - (UnitPrice * UnitPriceDiscount)) * OrderQty))
+
+# http://www.sthda.com/english/wiki/ggplot2-quick-correlation-matrix-heatmap-r-software-and-data-visualization
+get_upper_tri <- function(cormat) {
+  cormat[lower.tri(cormat)] <- NA
+  return(cormat)
+}
+
+reorder_cormat <- function(cormat){
+  # Use correlation between variables as distance
+  dd <- as.dist((1 - cormat) / 2)
+  hc <- hclust(dd)
+  cormat <- cormat[hc$order, hc$order]
+}
+
+# Tidying data
+SDSalesEmailPromo <- subset(SDSalesEmailPromo, !is.na(SDSalesEmailPromo$EmailPromotion))
+SDSalesEmailPromo[is.na(SDSalesEmailPromo$orderSize), ]$orderPrice <- 0
+SDSalesEmailPromo[is.na(SDSalesEmailPromo$orderSize), ]$orderSize <- 0
+
+# Create correlation matrix
+cormat <- round(cor(SDSalesEmailPromo[-c(1, 2)]), 4)
+melted_cormat <- cormat %>%
+  reorder_cormat() %>%
+  get_upper_tri() %>%
+  melt(na.rm = TRUE)
+
+p <- ggplot(data = melted_cormat, aes(x = Var1, y = Var2, fill = value)) + 
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "dodgerblue4", high = "firebrick1", mid = "white",
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name = "Correlation") +
+  coord_fixed() +
+  labs(x = "", y = "", title = "Correlation heatmap with EmailPromotion preferences") +
+  coord_fixed() +
+  geom_text(aes(Var1, Var2, label = value), color = "black", size = 4)
+ggplotly(p)
+```
+
+Row
+-----------------------------------------------------------------------
+
+```{r include = FALSE}
+rules <- apriori(trans4, parameter = list(support = 0.01, confidence = 0.8, minlen = 2, maxlen = 15))
+```
+
+### Association between product purchases
+
+```{r}
+plot(head(sort(rules, by = "confidence"), 10), method = "graph")
+```
+
+Internal Business Process
+=============
+
+Column {data-width=750}
+-----------------------------------------------------------------------
+
+### Recrutement Evolution
+
+```{r}
+p <- plot_ly(SDEmployee, x = ~year(ymd_hms(HireDate)), type = 'histogram',
+        marker = list(color = 'rgb(158,202,225)',
+                      line = list(color = 'rgb(8,48,107)',
+                                  width = 1.5))) %>%
+  layout(title = "Recrutement Evolution",
+         xaxis = list(title = "Date (Year)"),
+         yaxis = list(title = "Number of Recruits"))
+p
+```
+
+### Most Sick Employee
+
+```{r}
+ den <- head(SDEmployee[order(SDEmployee$SickLeaveHours, decreasing = TRUE), ], 10)
+ den[, c("FirstName", "LastName", "Title", "SickLeaveHours")] %>%
+   datatable(rownames = FALSE)
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Reminder {data-height=200}
+
+Remember, knowing your employee vacation hours density and
+employee sick hours permit you to know if the working condition in
+your company (AdventureWorks) is good enough. Please take in consideration
+those information.
+
+### Employee Vacation Density
+
+```{r}
+den <- density(SDEmployee$VacationHours)
+
+plot_ly(x = SDEmployee$VacationHours) %>% 
+  add_histogram(name = "Histogram") %>% 
+  add_lines(x = den$x, y = den$y, fill = "tozeroy", yaxis = "y2", name = "Density") %>%
+  layout(xaxis = list(title = "Vacation hours (hours)"), yaxis = list(title = "Density"), yaxis2 = list(overlaying = "y", side = "right"))
+```
+
+### Employee Sick-level Density
+
+```{r}
+den <- density(SDEmployee$SickLeaveHours)
+
+plot_ly(x = SDEmployee$SickLeaveHours) %>% 
+  add_histogram(name = "Histogram") %>% 
+  add_lines(x = den$x, y = den$y, fill = "tozeroy", yaxis = "y2", name = "Density", line = list(color = "red")) %>% 
+  layout(xaxis = list(title = "Sick hours (hours)"), yaxis = list(title = "Density"), yaxis2 = list(overlaying = "y", side = "right"))
+```
+
+
+Customer Perspective
+=============
+
+Row
+-----------------------------------------------------------------------
+
+### Customer distribution
+
+```{r}
+worldMap <- map_data("world") %>%
+            subset(region != "Antarctica")
+custRep <- inner_join(SDCustomer, SDSalesTerritory, by = "TerritoryID")
+custRep <- table(custRep$CountryRegionCode) %>%
+            as.data.frame() %>%
+            as_tibble()
+names(custRep) <- c("Country", "Customers")
+
+# Rename iso2 country code to country names
+custRep$Country <- countrycode(custRep$Country, "iso2c", "country.name")
+# Rename USA to be shown in ggplot
+custRep$Country[custRep$Country == "United States"] <- "USA"
+
+custMap <- ggplot() +
+            geom_map(dat = worldMap, map = worldMap, aes(map_id = region),
+                     fill = "white", color = "black", size = 0.25) +
+            geom_map(dat = custRep, map = worldMap, aes(map_id = Country,
+                     fill = Customers), size = 0.25) +
+            scale_fill_gradient(low = "#f7fcb9", high = "#238443", name = "Customers") +
+            expand_limits(x = worldMap$long, y = worldMap$lat) +
+            labs(x = "", y = "", title = "AdventureWorks world presence") +
+            theme(panel.grid = element_blank(), panel.border = element_blank()) +
+            theme(axis.ticks = element_blank(), axis.text = element_blank()) +
+            theme(legend.position = "top")
+custMap
+```
+
+Row
+-----------------------------------------------------------------------
+
+### Valuable Customers (in % of Total Sales)
+
+```{r}
+custValue <- SDSalesDev2 %>%
+  group_by(CustomerID) %>%
+  summarise(Value = round((sum(UnitPrice * OrderQty) / sum(SDSalesDev2$OrderQty * SDSalesDev2$UnitPrice) * 100), digits = 5))
+
+den <- head(custValue[order(custValue$Value, decreasing = TRUE), ], 20)
+den[, c("CustomerID", "Value")] %>%
+   datatable(rownames = FALSE)
+```
+
+### Non-Valuable Customers (in % of Total Sales)
+
+```{r}
+den <- head(custValue[order(custValue$Value, decreasing = FALSE), ], 20)
+den[, c("CustomerID", "Value")] %>%
+   datatable(rownames = FALSE)
+```
